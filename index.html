@@ -296,6 +296,14 @@
     padding: 32px; font-size: 13px;
   }
 
+  /* completed checkbox + locked rows */
+  .complete-cb { width: 16px; height: 16px; cursor: pointer; accent-color: var(--accent); }
+  tr.completed-row { opacity: 0.5; }
+  tr.completed-row .td-label { text-decoration: line-through; }
+  .star.locked { cursor: default; }
+  .star.locked:hover { transform: none; }
+  .time-input:disabled, .prog-input:disabled { cursor: not-allowed; opacity: 0.7; }
+
   /* ── result modal ── */
   .overlay {
     position: fixed; inset: 0;
@@ -353,7 +361,7 @@
         <div class="stats-table-wrap">
           <table class="stats-table">
             <thead><tr>
-              <th>Item</th><th>Rating</th><th>Time Spent</th><th>Progress</th>
+              <th>Item</th><th>Rating</th><th>Time Spent</th><th>Progress</th><th>Completed</th>
             </tr></thead>
             <tbody id="sb-left"></tbody>
           </table>
@@ -364,7 +372,7 @@
         <div class="stats-table-wrap">
           <table class="stats-table">
             <thead><tr>
-              <th>Item</th><th>Rating</th><th>Time Spent</th><th>Progress</th>
+              <th>Item</th><th>Rating</th><th>Time Spent</th><th>Progress</th><th>Completed</th>
             </tr></thead>
             <tbody id="sb-right"></tbody>
           </table>
@@ -382,6 +390,7 @@
     </div>
   </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function () {
   "use strict";
@@ -415,10 +424,61 @@
 
   function colorFor(i) { return COLORS[i % COLORS.length]; }
 
-  function ls(key, def) {
-    try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : def; } catch { return def; }
+  // ══════════ SHARED STORAGE (Supabase) ══════════
+  // 1. Create a free project at supabase.com
+  // 2. Settings → API → copy the Project URL and the "anon public" key below
+  const SUPABASE_URL  = "https://tjcayvpeapmlqycosrnz.supabase.co/rest/v1/";
+  const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRqY2F5dnBlYXBtbHF5Y29zcm56Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYzODIwOTksImV4cCI6MjEwMTk1ODA5OX0.3bADe9g0cSE8Ow440fAVktyimzpOKaLBW5mkOH2Ketg";
+
+  const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+
+  // In-memory mirror of the remote table, so the rest of the app can stay synchronous.
+  const CACHE = {};
+  const saveTimers = {};
+
+  // ── little status pill, bottom-right ──
+  const statusEl = document.createElement("div");
+  statusEl.style.cssText =
+    "position:fixed;right:14px;bottom:14px;z-index:99;padding:6px 12px;border-radius:999px;" +
+    "font:600 12px system-ui;background:rgba(0,0,0,0.45);border:1px solid #2e356a;color:#9aa3c7;" +
+    "opacity:0;transition:opacity 0.3s;pointer-events:none;backdrop-filter:blur(6px)";
+  document.body.appendChild(statusEl);
+  let statusTimer;
+  function setStatus(msg, sticky) {
+    statusEl.textContent = msg;
+    statusEl.style.opacity = "1";
+    clearTimeout(statusTimer);
+    if (!sticky) statusTimer = setTimeout(() => { statusEl.style.opacity = "0"; }, 1600);
   }
-  function lsSave(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }
+
+  // Pull every row into CACHE. Called once on boot, and again when the tab regains focus.
+  async function loadAll() {
+    const { data, error } = await db.from("wheel_state").select("key,value");
+    if (error) {
+      console.error("Load failed:", error);
+      setStatus("⚠ offline — changes won't save", true);
+      return false;
+    }
+    data.forEach(row => { CACHE[row.key] = row.value; });
+    return true;
+  }
+
+  // Same signatures as before, so nothing downstream changes.
+  function ls(key, def) {
+    return (key in CACHE && CACHE[key] != null) ? CACHE[key] : def;
+  }
+
+  function lsSave(key, val) {
+    CACHE[key] = val;                     // update locally right away — UI stays instant
+    clearTimeout(saveTimers[key]);        // debounce: typing fast shouldn't spam the DB
+    saveTimers[key] = setTimeout(async () => {
+      const { error } = await db
+        .from("wheel_state")
+        .upsert({ key, value: val, updated_at: new Date().toISOString() }, { onConflict: "key" });
+      if (error) { console.error("Save failed:", error); setStatus("⚠ save failed", true); }
+      else setStatus("saved ✓");
+    }, 400);
+  }
 
   // ── player registry for stats view ──
   const registry = {};
@@ -562,15 +622,39 @@
       name, grad, gradStart,
       getItems:  () => items,
       getStats:  () => stats,
+      // re-read from CACHE after a remote change and repaint
+      reload() {
+        stats = ls(statsKey, {});        // stats always refresh — no animation to disturb
+        if (spinning) return;            // but don't yank the wheel out mid-spin
+        items = ls(itemsKey, defaults);
+        renderList(); draw();
+      },
       setStat(item, key, val) {
-        if (!stats[item]) stats[item] = { rating: 0, timeSpent: "", progress: "Not Started" };
+        if (!stats[item]) stats[item] = { rating: 0, timeSpent: "", progress: "Not Started", completed: false };
         stats[item][key] = val;
         saveStats();
+      },
+      removeFromWheel(item) {
+        const idx = items.indexOf(item);
+        if (idx !== -1) {
+          items.splice(idx, 1);
+          saveItems();
+          renderList();
+          draw();
+        }
+      },
+      addToWheel(item) {
+        if (!items.includes(item)) {
+          items.push(item);
+          saveItems();
+          renderList();
+          draw();
+        }
       }
     };
   }
 
-  createPlayer({
+  const PLAYERS = [{
     containerId: "p-left",
     name:        "SnackDetective",
     itemsKey:    "wheel.snackdetective.items",
@@ -578,9 +662,7 @@
     gradStart:   "#ff5c8a",
     gradEnd:     "#ff9a5c",
     defaults:    ["Pizza","Burgers","Sushi","Tacos","Salad","Pasta"],
-  });
-
-  createPlayer({
+  }, {
     containerId: "p-right",
     name:        "Jasan",
     itemsKey:    "wheel.jasan.items",
@@ -588,28 +670,90 @@
     gradStart:   "#6c5ce7",
     gradEnd:     "#00c9ff",
     defaults:    ["Movies","Games","Hiking","Gym","Reading","Cooking"],
-  });
+  }];
+
+  // ── refresh every wheel + the stats table from CACHE ──
+  function repaintAll() {
+    Object.values(registry).forEach(p => p.reload());
+    const statsView = document.getElementById("view-stats");
+    if (!statsView || !statsView.classList.contains("active")) return;
+
+    // If they're mid-way through typing in a stats cell, don't rebuild the
+    // table underneath them — it would wipe the half-typed value.
+    const el = document.activeElement;
+    if (el && el.tagName === "INPUT" && el.type === "text" && statsView.contains(el)) return;
+
+    renderStatsTable("sb-left",  "p-left");
+    renderStatsTable("sb-right", "p-right");
+  }
+
+  // ── boot: load remote data FIRST, then build the wheels ──
+  (async function boot() {
+    setStatus("loading…", true);
+    const online = await loadAll();
+
+    PLAYERS.forEach(createPlayer);
+
+    if (!online) return;   // offline: wheels still work locally, just won't persist
+
+    // First run on a fresh database — write the starting lists so both people see the same thing
+    PLAYERS.forEach(p => {
+      if (!(p.itemsKey in CACHE)) lsSave(p.itemsKey, p.defaults);
+      if (!(p.statsKey in CACHE)) lsSave(p.statsKey, {});
+    });
+
+    setStatus("connected ✓");
+
+    // Live sync: when the other person edits, update without a refresh
+    db.channel("wheel-sync")
+      .on("postgres_changes",
+          { event: "*", schema: "public", table: "wheel_state" },
+          payload => {
+            const row = payload.new;
+            if (!row || !row.key) return;
+            // ignore the echo of our own write
+            if (JSON.stringify(CACHE[row.key]) === JSON.stringify(row.value)) return;
+            CACHE[row.key] = row.value;
+            repaintAll();
+            setStatus("updated by other player");
+          })
+      .subscribe();
+
+    // Safety net if realtime drops or was never enabled: re-sync when the tab is refocused
+    document.addEventListener("visibilitychange", async () => {
+      if (document.visibilityState !== "visible") return;
+      if (await loadAll()) repaintAll();
+    });
+  })();
 
   // ── stats table renderer ──
   function renderStatsTable(tbodyId, playerKey) {
     const player = registry[playerKey];
     const tbody  = document.getElementById(tbodyId);
-    const items  = player.getItems();
     const stats  = player.getStats();
+
+    // wheel items, plus any completed items that were already removed from the wheel
+    const items = player.getItems().slice();
+    Object.keys(stats).forEach(key => {
+      if (stats[key].completed && !items.includes(key)) items.push(key);
+    });
+
     tbody.innerHTML = "";
 
     if (!items.length) {
       const tr = document.createElement("tr");
       const td = document.createElement("td");
-      td.colSpan = 4;
+      td.colSpan = 5;
       td.className = "stats-empty";
       td.textContent = "No items on the wheel yet.";
       tr.appendChild(td); tbody.appendChild(tr); return;
     }
 
     items.forEach((item, i) => {
-      const s = stats[item] || { rating: 0, timeSpent: "", progress: "Not Started" };
+      const s = stats[item] || { rating: 0, timeSpent: "", progress: "Not Started", completed: false };
+      const locked = !!s.completed;
       const tr = document.createElement("tr");
+      if (locked) tr.classList.add("completed-row");
 
       // item cell
       const tdItem = document.createElement("td");
@@ -623,12 +767,14 @@
       const starWrap = document.createElement("div"); starWrap.className = "stars";
       for (let star=1; star<=5; star++) {
         const btn = document.createElement("span");
-        btn.className = "star" + (star <= s.rating ? " on" : "");
+        btn.className = "star" + (star <= s.rating ? " on" : "") + (locked ? " locked" : "");
         btn.textContent = "★";
-        btn.addEventListener("click", () => {
-          player.setStat(item, "rating", star);
-          renderStatsTable(tbodyId, playerKey);
-        });
+        if (!locked) {
+          btn.addEventListener("click", () => {
+            player.setStat(item, "rating", star);
+            renderStatsTable(tbodyId, playerKey);
+          });
+        }
         starWrap.appendChild(btn);
       }
       tdRating.appendChild(starWrap);
@@ -639,6 +785,7 @@
       timeInput.className = "time-input"; timeInput.type = "text";
       timeInput.placeholder = "e.g. 2h"; timeInput.maxLength = 20;
       timeInput.value = s.timeSpent || "";
+      timeInput.disabled = locked;
       timeInput.addEventListener("change", () => player.setStat(item, "timeSpent", timeInput.value.trim()));
       tdTime.appendChild(timeInput);
 
@@ -648,10 +795,24 @@
       progInput.className = "prog-input"; progInput.type = "text";
       progInput.placeholder = "e.g. 50%"; progInput.maxLength = 40;
       progInput.value = s.progress || "";
+      progInput.disabled = locked;
       progInput.addEventListener("change", () => player.setStat(item, "progress", progInput.value.trim()));
       tdProg.appendChild(progInput);
 
-      tr.append(tdItem, tdRating, tdTime, tdProg);
+      // completed checkbox cell
+      const tdComplete = document.createElement("td");
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.className = "complete-cb";
+      cb.checked = locked;
+      cb.addEventListener("change", () => {
+        player.setStat(item, "completed", cb.checked);
+        if (cb.checked) player.removeFromWheel(item);
+        else player.addToWheel(item);
+        renderStatsTable(tbodyId, playerKey);
+      });
+      tdComplete.appendChild(cb);
+
+      tr.append(tdItem, tdRating, tdTime, tdProg, tdComplete);
       tbody.appendChild(tr);
     });
   }
